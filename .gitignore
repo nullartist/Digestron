@@ -142,7 +142,7 @@ vite.config.ts.timestamp-*
 .digestron/
 
 # Go build artifacts
-digestron
+/digestron
 
 
 # Diagnostic reports (https://nodejs.org/api/report.html)
