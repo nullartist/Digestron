@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
@@ -51,12 +52,34 @@ func runDoctor(_ *cobra.Command, args []string) error {
 		}
 	}
 
-	// Check ts-extract node_modules (look relative to the binary location first, then cwd)
+	// Check ts-extract node_modules; install if absent using npm ci (with lockfile) or npm install.
 	tsExtractDir := filepath.Join("tools", "ts-extract")
 	nmDir := filepath.Join(tsExtractDir, "node_modules")
+	lockFile := filepath.Join(tsExtractDir, "package-lock.json")
+	useCI := fileExists(lockFile)
 	if _, err := os.Stat(nmDir); os.IsNotExist(err) {
-		fmt.Fprintf(os.Stderr, "  ✗  tools/ts-extract/node_modules not found — run: cd %s && npm install\n", tsExtractDir)
-		ok = false
+		npmBin, lookErr := exec.LookPath("npm")
+		if lookErr != nil {
+			fmt.Fprintf(os.Stderr, "  ⚠  npm not found in PATH, trying 'npm' anyway\n")
+			npmBin = "npm"
+		}
+		if useCI {
+			fmt.Println("  • node_modules not found. Running npm ci in tools/ts-extract ...")
+			if out, err := runCmd(tsExtractDir, npmBin, "ci"); err != nil {
+				fmt.Fprintf(os.Stderr, "  ✗  npm ci failed: %v\n%s\n", err, out)
+				ok = false
+			} else {
+				fmt.Println("  ✓  npm dependencies installed (ci)")
+			}
+		} else {
+			fmt.Println("  • node_modules not found. Running npm install in tools/ts-extract ...")
+			if out, err := runCmd(tsExtractDir, npmBin, "install"); err != nil {
+				fmt.Fprintf(os.Stderr, "  ✗  npm install failed: %v\n%s\n", err, out)
+				ok = false
+			} else {
+				fmt.Println("  ✓  npm dependencies installed")
+			}
+		}
 	} else {
 		fmt.Printf("  ✓  tools/ts-extract/node_modules present\n")
 	}
@@ -118,6 +141,19 @@ func detectTsconfigs(root string) []string {
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+// runCmd runs a command in dir and returns combined output.
+func runCmd(dir, name string, args ...string) ([]byte, error) {
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Run(); err != nil {
+		return out.Bytes(), err
+	}
+	return out.Bytes(), nil
 }
 
 // parseNodeMajor parses "v20.1.0" -> 20.
