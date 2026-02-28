@@ -7,6 +7,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// rootFlags holds flags that are shared across commands.
+var rootFlags struct {
+	Config string
+}
+
 var rootCmd = &cobra.Command{
 	Use:   "digestron",
 	Short: "Digestron — structural codebase indexer for LLMs",
@@ -23,6 +28,8 @@ func Execute() {
 }
 
 func init() {
+	rootCmd.PersistentFlags().StringVar(&rootFlags.Config, "config", "", "Path to digestron config file (default: auto)")
+
 	rootCmd.AddCommand(doctorCmd)
 	rootCmd.AddCommand(indexCmd)
 	rootCmd.AddCommand(analyzeCmd)

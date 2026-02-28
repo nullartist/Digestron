@@ -1,29 +1,41 @@
 package commands
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 
 	"github.com/spf13/cobra"
 
+	"github.com/nullartist/digestron/internal/search"
 	"github.com/nullartist/digestron/internal/usg"
 )
 
-var analyzeRoot string
+var analyzeFlags struct {
+	JSON bool
+}
 
 var analyzeCmd = &cobra.Command{
-	Use:   "analyze",
-	Short: "Print a summary of the indexed USG",
-	Long:  `Loads .digestron/usg.v0.1.json and prints a structural summary.`,
-	RunE:  runAnalyze,
+	Use:   "analyze <query> [path]",
+	Short: "Search symbols in the indexed USG",
+	Long: `Searches the USG for symbols matching <query> (by name or qname).
+[path] is the repository root (default: current directory).`,
+	Args: cobra.RangeArgs(1, 2),
+	RunE: runAnalyze,
 }
 
 func init() {
-	analyzeCmd.Flags().StringVar(&analyzeRoot, "root", ".", "Path to the repository root")
+	analyzeCmd.Flags().BoolVar(&analyzeFlags.JSON, "json", false, "Output results as JSON")
 }
 
-func runAnalyze(_ *cobra.Command, _ []string) error {
-	absRoot, err := filepath.Abs(analyzeRoot)
+func runAnalyze(_ *cobra.Command, args []string) error {
+	query := args[0]
+	root := "."
+	if len(args) == 2 {
+		root = args[1]
+	}
+	absRoot, err := filepath.Abs(root)
 	if err != nil {
 		return fmt.Errorf("analyze: resolve root: %w", err)
 	}
@@ -33,32 +45,46 @@ func runAnalyze(_ *cobra.Command, _ []string) error {
 		return fmt.Errorf("analyze: load USG: %w", err)
 	}
 
-	s := graph.Stats
-	fmt.Printf("USG v%s  root=%s  generated=%s\n", graph.Version, graph.Root, graph.GeneratedAt)
-	fmt.Printf("  modules             : %d\n", s.TotalModules)
-	fmt.Printf("  symbols             : %d\n", s.TotalSymbols)
-	fmt.Printf("  calls (total)       : %d\n", s.CallsTotal)
-	fmt.Printf("    resolved          : %d\n", s.CallsResolved)
-	fmt.Printf("    inferred          : %d\n", s.CallsInferred)
-	fmt.Printf("    dynamic           : %d\n", s.CallsDynamic)
-	fmt.Printf("  resolvedEdgeRatio   : %.3f\n", s.ResolvedEdgeRatio)
-	fmt.Printf("  dynamicRatio        : %.3f\n", s.DynamicRatio)
-	fmt.Printf("  symbolCoverageRatio : %.3f\n", s.SymbolCoverageRatio)
-	fmt.Printf("  structuralConfidence: %.3f\n", s.StructuralConfidence)
+	results := search.Find(graph, query)
 
-	if len(graph.RiskFlags) > 0 {
-		fmt.Printf("\nRisk flags (%d):\n", len(graph.RiskFlags))
-		for _, rf := range graph.RiskFlags {
-			fmt.Printf("  [%s] %s:%d — %s\n", rf.Kind, rf.Loc.File, rf.Loc.Line, rf.Note)
+	if analyzeFlags.JSON {
+		type jsonResult struct {
+			SymbolID  string `json:"symbolId"`
+			QName     string `json:"qname"`
+			Name      string `json:"name"`
+			Kind      string `json:"kind"`
+			Signature string `json:"signature"`
+			Score     int    `json:"score"`
 		}
+		var out []jsonResult
+		for _, r := range results {
+			out = append(out, jsonResult{
+				SymbolID:  r.Symbol.ID,
+				QName:     r.Symbol.QName,
+				Name:      r.Symbol.Name,
+				Kind:      r.Symbol.Kind,
+				Signature: r.Symbol.Signature,
+				Score:     r.Score,
+			})
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(out)
 	}
 
-	if len(graph.EntryPoints) > 0 {
-		fmt.Printf("\nEntry points (%d):\n", len(graph.EntryPoints))
-		for _, ep := range graph.EntryPoints {
-			fmt.Printf("  [%s] %s\n", ep.Kind, ep.File)
+	fmt.Printf("Searching %q in %s\n", query, absRoot)
+	fmt.Printf("Found %d match(es):\n\n", len(results))
+	for i, r := range results {
+		fmt.Printf("  %d. [%s] %s\n", i+1, r.Symbol.Kind, r.Symbol.QName)
+		fmt.Printf("     id: %s\n", r.Symbol.ID)
+		if r.Symbol.Signature != "" {
+			fmt.Printf("     sig: %s\n", r.Symbol.Signature)
 		}
+		fmt.Printf("     loc: %s:%d\n", r.Symbol.Loc.File, r.Symbol.Loc.StartLine)
+		fmt.Println()
 	}
-
+	if len(results) == 0 {
+		fmt.Println("  (no matches)")
+	}
 	return nil
 }

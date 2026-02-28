@@ -13,23 +13,30 @@ import (
 	"github.com/nullartist/digestron/internal/usg"
 )
 
-var indexRoot string
-var indexTsconfigs []string
+var indexFlags struct {
+	Tsconfig     []string
+	IncludeTests bool
+}
 
 var indexCmd = &cobra.Command{
-	Use:   "index",
+	Use:   "index [path]",
 	Short: "Index a TypeScript repository into a USG",
-	Long:  `Runs the TypeScript extractor and writes .digestron/usg.v0.1.json.`,
+	Long:  `Runs the TypeScript extractor and writes .digestron/usg.v0.1.json in [path] (default: current directory).`,
+	Args:  cobra.MaximumNArgs(1),
 	RunE:  runIndex,
 }
 
 func init() {
-	indexCmd.Flags().StringVar(&indexRoot, "root", ".", "Path to the repository root")
-	indexCmd.Flags().StringSliceVar(&indexTsconfigs, "tsconfig", nil, "tsconfig path(s) relative to root (auto-detected if empty)")
+	indexCmd.Flags().StringSliceVar(&indexFlags.Tsconfig, "tsconfig", nil, "tsconfig path(s) relative to root (auto-detected if empty)")
+	indexCmd.Flags().BoolVar(&indexFlags.IncludeTests, "include-tests", false, "Include test files in the extraction")
 }
 
-func runIndex(_ *cobra.Command, _ []string) error {
-	absRoot, err := filepath.Abs(indexRoot)
+func runIndex(_ *cobra.Command, args []string) error {
+	root := "."
+	if len(args) == 1 {
+		root = args[0]
+	}
+	absRoot, err := filepath.Abs(root)
 	if err != nil {
 		return fmt.Errorf("index: resolve root: %w", err)
 	}
@@ -41,10 +48,12 @@ func runIndex(_ *cobra.Command, _ []string) error {
 
 	fmt.Printf("Indexing %s ...\n", absRoot)
 
-	resp, err := indexer.RunTSExtract(scriptPath, absRoot, indexTsconfigs)
+	resp, err := indexer.RunTSExtract(scriptPath, absRoot, indexFlags.Tsconfig, indexFlags.IncludeTests)
 	if err != nil {
-		for _, d := range resp.Diagnostics {
-			fmt.Fprintf(os.Stderr, "[%s] %s: %s\n", d.Level, d.Code, d.Message)
+		if resp != nil {
+			for _, d := range resp.Diagnostics {
+				fmt.Fprintf(os.Stderr, "[%s] %s: %s\n", d.Level, d.Code, d.Message)
+			}
 		}
 		return fmt.Errorf("index: extraction failed: %w", err)
 	}
@@ -55,14 +64,14 @@ func runIndex(_ *cobra.Command, _ []string) error {
 
 	// Unmarshal raw into USG edges/symbols/modules
 	var raw struct {
-		Modules      []usg.Module          `json:"modules"`
-		Symbols      []usg.Symbol          `json:"symbols"`
-		Calls        []usg.CallEdge        `json:"calls"`
-		Inherits     []usg.InheritanceEdge `json:"inherits"`
+		Modules      []usg.Module            `json:"modules"`
+		Symbols      []usg.Symbol            `json:"symbols"`
+		Calls        []usg.CallEdge          `json:"calls"`
+		Inherits     []usg.InheritanceEdge   `json:"inherits"`
 		Instantiates []usg.InstantiationSite `json:"instantiates"`
-		EntryPoints  []usg.EntryPoint      `json:"entryPoints"`
-		RiskFlags    []usg.RiskFlag        `json:"riskFlags"`
-		Stats        usg.Stats             `json:"stats"`
+		EntryPoints  []usg.EntryPoint        `json:"entryPoints"`
+		RiskFlags    []usg.RiskFlag          `json:"riskFlags"`
+		Stats        usg.Stats               `json:"stats"`
 	}
 	if err := json.Unmarshal(resp.Raw, &raw); err != nil {
 		return fmt.Errorf("index: unmarshal raw: %w", err)

@@ -2,32 +2,46 @@ package commands
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
 
+	"github.com/nullartist/digestron/internal/focus"
+	"github.com/nullartist/digestron/internal/search"
 	"github.com/nullartist/digestron/internal/usg"
 )
 
-var impactRoot string
-var impactSymbol string
+var impactFlags struct {
+	Radius      int
+	BudgetChars int
+	JSON        bool
+}
 
 var impactCmd = &cobra.Command{
-	Use:   "impact",
-	Short: "Show symbols that call a given symbol",
-	Long:  `Loads the USG and lists all callers of the specified symbol (by name or qname).`,
-	RunE:  runImpact,
+	Use:   "impact <symbol-ref> [path]",
+	Short: "Print the Focus Pack for a symbol",
+	Long: `Builds and prints an impact-aware Focus Pack for <symbol-ref>.
+<symbol-ref> is a symbol name, qname, or symbolId.
+[path] is the repository root (default: current directory).`,
+	Args: cobra.RangeArgs(1, 2),
+	RunE: runImpact,
 }
 
 func init() {
-	impactCmd.Flags().StringVar(&impactRoot, "root", ".", "Path to the repository root")
-	impactCmd.Flags().StringVar(&impactSymbol, "symbol", "", "Symbol name or qname to look up")
-	_ = impactCmd.MarkFlagRequired("symbol")
+	impactCmd.Flags().IntVar(&impactFlags.Radius, "radius", 2, "BFS radius for caller traversal")
+	impactCmd.Flags().IntVar(&impactFlags.BudgetChars, "budget-chars", 8000, "Max characters for text output")
+	impactCmd.Flags().BoolVar(&impactFlags.JSON, "json", false, "Output the focus subgraph as JSON")
 }
 
-func runImpact(_ *cobra.Command, _ []string) error {
-	absRoot, err := filepath.Abs(impactRoot)
+func runImpact(_ *cobra.Command, args []string) error {
+	symbolRef := args[0]
+	root := "."
+	if len(args) == 2 {
+		root = args[1]
+	}
+	absRoot, err := filepath.Abs(root)
 	if err != nil {
 		return fmt.Errorf("impact: resolve root: %w", err)
 	}
@@ -37,48 +51,48 @@ func runImpact(_ *cobra.Command, _ []string) error {
 		return fmt.Errorf("impact: load USG: %w", err)
 	}
 
-	// Find matching target symbols (by qname or name substring).
-	var targetIDs []string
-	for _, sym := range graph.Symbols {
-		if sym.QName == impactSymbol || sym.Name == impactSymbol ||
-			strings.HasSuffix(sym.QName, "::"+impactSymbol) {
-			targetIDs = append(targetIDs, sym.ID)
+	// Resolve symbol-ref → symbolId.
+	// Accept bare symbolId directly (starts with "sym_"), or search by name/qname.
+	seedID := ""
+	if strings.HasPrefix(symbolRef, "sym_") {
+		// verify it exists
+		for _, s := range graph.Symbols {
+			if s.ID == symbolRef {
+				seedID = symbolRef
+				break
+			}
 		}
 	}
-	if len(targetIDs) == 0 {
-		return fmt.Errorf("impact: symbol %q not found in USG", impactSymbol)
-	}
-
-	targetSet := make(map[string]bool, len(targetIDs))
-	for _, id := range targetIDs {
-		targetSet[id] = true
-	}
-
-	// Collect callers.
-	callerIDs := make(map[string]bool)
-	for _, call := range graph.Edges.Calls {
-		if call.ToSymbolID != nil && targetSet[*call.ToSymbolID] {
-			callerIDs[call.FromSymbolID] = true
+	if seedID == "" {
+		results := search.Find(graph, symbolRef)
+		if len(results) == 0 {
+			return fmt.Errorf("impact: symbol %q not found in USG", symbolRef)
 		}
+		if len(results) > 1 {
+			fmt.Fprintf(os.Stderr, "warning: %d symbols match %q; using top result\n", len(results), symbolRef)
+		}
+		seedID = results[0].Symbol.ID
 	}
 
-	// Resolve caller symbols.
-	symByID := make(map[string]usg.Symbol, len(graph.Symbols))
-	for _, s := range graph.Symbols {
-		symByID[s.ID] = s
+	opts := focus.Options{
+		Radius:      impactFlags.Radius,
+		BudgetChars: impactFlags.BudgetChars,
 	}
 
-	fmt.Printf("Impact analysis for %q (%d match(es)):\n", impactSymbol, len(targetIDs))
-	if len(callerIDs) == 0 {
-		fmt.Println("  (no callers found)")
+	pack, err := focus.Build(graph, seedID, opts)
+	if err != nil {
+		return fmt.Errorf("impact: %w", err)
+	}
+
+	if impactFlags.JSON {
+		data, err := focus.FormatJSON(pack)
+		if err != nil {
+			return fmt.Errorf("impact: json: %w", err)
+		}
+		fmt.Println(string(data))
 		return nil
 	}
-	for id := range callerIDs {
-		if s, ok := symByID[id]; ok {
-			fmt.Printf("  %s  [%s]  %s\n", s.QName, s.Kind, s.Loc.File)
-		} else {
-			fmt.Printf("  <unknown sym %s>\n", id)
-		}
-	}
+
+	fmt.Print(focus.FormatText(pack, graph, opts))
 	return nil
 }

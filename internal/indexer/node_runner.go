@@ -37,11 +37,11 @@ type ExtractResponse struct {
 
 // RunTSExtract executes the ts-extract Node.js tool as a child process,
 // sending a request via stdin and returning the parsed response.
-func RunTSExtract(scriptPath string, repoRoot string, tsconfigs []string) (*ExtractResponse, error) {
+func RunTSExtract(scriptPath string, repoRoot string, tsconfigs []string, includeTests bool) (*ExtractResponse, error) {
 	req := ExtractRequest{
 		RepoRoot:      repoRoot,
 		TsconfigPaths: tsconfigs,
-		IncludeTests:  false,
+		IncludeTests:  includeTests,
 		MaxFiles:      200000,
 		Emit: map[string]bool{
 			"modules":     true,
