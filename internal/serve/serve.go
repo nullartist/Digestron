@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/nullartist/digestron/internal/cache"
@@ -23,14 +22,6 @@ import (
 	"github.com/nullartist/digestron/internal/usg"
 )
 
-// State holds the in-memory server state shared across requests.
-type State struct {
-	mu       sync.RWMutex
-	repoRoot string
-	graph    *usg.USG
-	view     *usg.View
-}
-
 // Run starts the NDJSON stdio server rooted at repoPath.
 // It blocks until stdin is closed or an I/O error occurs.
 func Run(repoPath string) error {
@@ -39,13 +30,10 @@ func Run(repoPath string) error {
 		return err
 	}
 
-	st := &State{repoRoot: repoAbs}
+	st := NewState(repoAbs)
 
-	// Try to warm up from a previously indexed USG so the first request is fast.
-	if g, err := usg.Load(repoAbs); err == nil {
-		st.graph = g
-		st.view = usg.BuildView(g)
-	}
+	// Warm the default repo on boot so the first request is fast (best-effort).
+	_, _ = st.getOrWarm(repoAbs)
 
 	in := bufio.NewScanner(os.Stdin)
 	// Allow large requests (up to 8 MiB per line).
@@ -103,11 +91,22 @@ func handle(st *State, req proto.Request) proto.Response {
 			Result: map[string]any{"status": "ok"}}
 
 	case "health":
+		repoAbs, err := resolveRepo(st, req.Params)
+		if err != nil {
+			return proto.Response{V: req.V, ID: req.ID, Ok: false,
+				Error: &proto.ErrorObj{Code: "BAD_REPO", Message: err.Error()}}
+		}
+		rs, _ := st.getOrWarm(repoAbs)
 		st.mu.RLock()
-		indexed := st.graph != nil
+		cachedRepos := len(st.repos)
 		st.mu.RUnlock()
 		return proto.Response{V: req.V, ID: req.ID, Ok: true,
-			Result: map[string]any{"indexed": indexed}}
+			Result: map[string]any{
+				"repoRoot":    repoAbs,
+				"indexed":     rs.USG != nil,
+				"usgPath":     usg.OutputPath(repoAbs),
+				"cachedRepos": cachedRepos,
+			}}
 
 	case "index":
 		return handleIndex(st, req)
@@ -129,9 +128,13 @@ func handle(st *State, req proto.Request) proto.Response {
 
 // handleIndex runs the TypeScript extractor, persists the USG, and updates State.
 func handleIndex(st *State, req proto.Request) proto.Response {
-	st.mu.RLock()
-	repoRoot := st.repoRoot
-	st.mu.RUnlock()
+	repoAbs, err := resolveRepo(st, req.Params)
+	if err != nil {
+		return proto.Response{V: req.V, ID: req.ID, Ok: false,
+			Error: &proto.ErrorObj{Code: "BAD_REPO", Message: err.Error()}}
+	}
+	rs, _ := st.getOrWarm(repoAbs)
+	repoRoot := rs.RepoRoot
 
 	// Optional params.
 	var tsconfigs []string
@@ -162,8 +165,9 @@ func handleIndex(st *State, req proto.Request) proto.Response {
 	if c, err := cache.Load(repoRoot); err == nil && cache.IsClean(repoRoot, c) {
 		if g, err := usg.Load(repoRoot); err == nil {
 			st.mu.Lock()
-			st.graph = g
-			st.view = usg.BuildView(g)
+			rs.USG = g
+			rs.View = usg.BuildView(g)
+			rs.LastUsedAt = time.Now()
 			st.mu.Unlock()
 			return proto.Response{V: req.V, ID: req.ID, Ok: true, Result: map[string]any{
 				"cached":  true,
@@ -227,8 +231,9 @@ func handleIndex(st *State, req proto.Request) proto.Response {
 
 	// Update in-memory state.
 	st.mu.Lock()
-	st.graph = g
-	st.view = usg.BuildView(g)
+	rs.USG = g
+	rs.View = usg.BuildView(g)
+	rs.LastUsedAt = time.Now()
 	st.mu.Unlock()
 
 	// Persist cache metadata.
@@ -271,9 +276,13 @@ func handleIndex(st *State, req proto.Request) proto.Response {
 
 // handleSearch searches the in-memory USG for a symbol by name/qname.
 func handleSearch(st *State, req proto.Request) proto.Response {
-	st.mu.RLock()
-	g := st.graph
-	st.mu.RUnlock()
+	repoAbs, err := resolveRepo(st, req.Params)
+	if err != nil {
+		return proto.Response{V: req.V, ID: req.ID, Ok: false,
+			Error: &proto.ErrorObj{Code: "BAD_REPO", Message: err.Error()}}
+	}
+	rs, _ := st.getOrWarm(repoAbs)
+	g := rs.USG
 
 	if g == nil {
 		return proto.Response{V: req.V, ID: req.ID, Ok: false,
@@ -312,32 +321,21 @@ func handleSearch(st *State, req proto.Request) proto.Response {
 
 // handleImpact builds a FocusPackJSON for the requested symbol.
 func handleImpact(st *State, req proto.Request) proto.Response {
-	st.mu.RLock()
-	g := st.graph
-	v := st.view
-	repoRoot := st.repoRoot
-	st.mu.RUnlock()
-
-	// Try to load from disk when not yet indexed (nice UX).
-	if g == nil || v == nil {
-		if rr, ok := req.Params["repoRoot"].(string); ok && rr != "" {
-			if abs, err := filepath.Abs(rr); err == nil {
-				repoRoot = abs
-			}
-		}
-		loaded, err := usg.Load(repoRoot)
-		if err != nil {
-			return proto.Response{V: req.V, ID: req.ID, Ok: false,
-				Error: &proto.ErrorObj{Code: "NOT_INDEXED", Message: "run index first"}}
-		}
-		g = loaded
-		v = usg.BuildView(loaded)
-		st.mu.Lock()
-		st.repoRoot = repoRoot
-		st.graph = g
-		st.view = v
-		st.mu.Unlock()
+	repoAbs, err := resolveRepo(st, req.Params)
+	if err != nil {
+		return proto.Response{V: req.V, ID: req.ID, Ok: false,
+			Error: &proto.ErrorObj{Code: "BAD_REPO", Message: err.Error()}}
 	}
+	rs, _ := st.getOrWarm(repoAbs)
+
+	if rs.USG == nil || rs.View == nil {
+		return proto.Response{V: req.V, ID: req.ID, Ok: false,
+			Error: &proto.ErrorObj{Code: "NOT_INDEXED", Message: "run index first"}}
+	}
+
+	g := rs.USG
+	v := rs.View
+	repoRoot := rs.RepoRoot
 
 	ref, _ := req.Params["ref"].(string)
 	if ref == "" {
@@ -398,9 +396,13 @@ func handleImpact(st *State, req proto.Request) proto.Response {
 // handleSnippets extracts code snippets for an explicit list of locations.
 // Accepts either a "requests" or legacy "locs" array in params.
 func handleSnippets(st *State, req proto.Request) proto.Response {
-	st.mu.RLock()
-	repoRoot := st.repoRoot
-	st.mu.RUnlock()
+	repoAbs, err := resolveRepo(st, req.Params)
+	if err != nil {
+		return proto.Response{V: req.V, ID: req.ID, Ok: false,
+			Error: &proto.ErrorObj{Code: "BAD_REPO", Message: err.Error()}}
+	}
+	rs, _ := st.getOrWarm(repoAbs)
+	repoRoot := rs.RepoRoot
 
 	budgetChars := 8000
 	if b, ok := req.Params["budgetChars"].(float64); ok && int(b) > 0 {

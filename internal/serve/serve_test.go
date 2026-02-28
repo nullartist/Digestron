@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nullartist/digestron/internal/proto"
 	"github.com/nullartist/digestron/internal/usg"
@@ -14,10 +16,16 @@ import (
 // helpers
 
 func makeState(g *usg.USG) *State {
-	st := &State{repoRoot: mockTempDir()}
+	dir := mockTempDir()
+	st := NewState(dir)
 	if g != nil {
-		st.graph = g
-		st.view = usg.BuildView(g)
+		rs := &RepoState{
+			RepoRoot:   dir,
+			USG:        g,
+			View:       usg.BuildView(g),
+			LastUsedAt: time.Now(),
+		}
+		st.repos[dir] = rs
 	}
 	return st
 }
@@ -193,5 +201,145 @@ func TestWriteResp_NDJSON(t *testing.T) {
 	}
 	if !got.Ok {
 		t.Error("ok should be true")
+	}
+}
+
+// ---- multi-repo tests ----
+
+func TestHandle_Health_ReturnsRepoFields(t *testing.T) {
+	st := makeState(nil)
+	resp := handle(st, req("health", nil))
+	if !resp.Ok {
+		t.Fatalf("health: expected ok=true, got %+v", resp.Error)
+	}
+	m, _ := resp.Result.(map[string]any)
+	if _, ok := m["repoRoot"]; !ok {
+		t.Error("health result should contain repoRoot")
+	}
+	if _, ok := m["usgPath"]; !ok {
+		t.Error("health result should contain usgPath")
+	}
+	if _, ok := m["cachedRepos"]; !ok {
+		t.Error("health result should contain cachedRepos")
+	}
+}
+
+func TestHandle_Health_MultiRepoParam(t *testing.T) {
+	g := &usg.USG{Symbols: []usg.Symbol{sym("s1", "a::Foo", "Foo", "function", "a.ts", 1)}}
+	st := makeState(nil)
+	// Pre-populate a second repo
+	repoB := "/tmp/digestron-repo-b"
+	st.repos[repoB] = &RepoState{
+		RepoRoot:   repoB,
+		USG:        g,
+		View:       usg.BuildView(g),
+		LastUsedAt: time.Now(),
+	}
+	resp := handle(st, req("health", map[string]interface{}{"repoRoot": repoB}))
+	if !resp.Ok {
+		t.Fatalf("health: expected ok=true, got %+v", resp.Error)
+	}
+	m, _ := resp.Result.(map[string]any)
+	if m["indexed"] != true {
+		t.Errorf("health.indexed should be true for pre-populated repo")
+	}
+	if m["repoRoot"] != repoB {
+		t.Errorf("health.repoRoot = %v, want %s", m["repoRoot"], repoB)
+	}
+}
+
+func TestState_LRUEviction(t *testing.T) {
+	st := NewState("/tmp/default")
+	st.maxRepos = 3
+	// Fill to capacity
+	for i := 0; i < 3; i++ {
+		path := fmt.Sprintf("/tmp/repo-%d", i)
+		st.repos[path] = &RepoState{
+			RepoRoot:   path,
+			LastUsedAt: time.Now().Add(time.Duration(i) * time.Second),
+		}
+	}
+	// Adding one more should evict the oldest (repo-0)
+	st.mu.Lock()
+	st.evictOneLocked()
+	st.mu.Unlock()
+	if _, ok := st.repos["/tmp/repo-0"]; ok {
+		t.Error("expected oldest repo to be evicted")
+	}
+	if _, ok := st.repos["/tmp/repo-2"]; !ok {
+		t.Error("expected newest repo to remain")
+	}
+}
+
+func TestState_LRUEviction_ViaGetOrWarm(t *testing.T) {
+	st := NewState("/tmp/default")
+	st.maxRepos = 2
+	// Fill to capacity via getOrWarm (repos on non-existent paths, no disk load)
+	_, _ = st.getOrWarm("/tmp/evict-repo-old")
+	// Ensure the old repo has an older timestamp
+	st.mu.Lock()
+	st.repos["/tmp/evict-repo-old"].LastUsedAt = time.Now().Add(-time.Hour)
+	st.mu.Unlock()
+	_, _ = st.getOrWarm("/tmp/evict-repo-new")
+	// Adding a third repo should evict the oldest
+	_, _ = st.getOrWarm("/tmp/evict-repo-third")
+	st.mu.RLock()
+	_, oldStillPresent := st.repos["/tmp/evict-repo-old"]
+	_, newStillPresent := st.repos["/tmp/evict-repo-new"]
+	st.mu.RUnlock()
+	if oldStillPresent {
+		t.Error("expected oldest repo to be evicted when maxRepos exceeded")
+	}
+	if !newStillPresent {
+		t.Error("expected newer repo to remain after eviction")
+	}
+}
+
+func TestResolveRepo_Default(t *testing.T) {
+	st := NewState("/tmp/default-repo")
+	got, err := resolveRepo(st, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "/tmp/default-repo" {
+		t.Errorf("resolveRepo = %q, want /tmp/default-repo", got)
+	}
+}
+
+func TestResolveRepo_FromParams(t *testing.T) {
+	st := NewState("/tmp/default-repo")
+	got, err := resolveRepo(st, map[string]interface{}{"repoRoot": "/tmp/other-repo"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "/tmp/other-repo" {
+		t.Errorf("resolveRepo = %q, want /tmp/other-repo", got)
+	}
+}
+
+func TestHandle_Search_MultiRepo(t *testing.T) {
+	g := &usg.USG{Symbols: []usg.Symbol{sym("s1", "src/a.ts::Bar", "Bar", "function", "src/a.ts", 10)}}
+	repoB := "/tmp/digestron-repo-search"
+	st := NewState(mockTempDir())
+	st.repos[repoB] = &RepoState{
+		RepoRoot:   repoB,
+		USG:        g,
+		View:       usg.BuildView(g),
+		LastUsedAt: time.Now(),
+	}
+	resp := handle(st, req("search", map[string]interface{}{
+		"repoRoot": repoB,
+		"query":    "Bar",
+	}))
+	if !resp.Ok {
+		t.Fatalf("expected ok=true, got %+v", resp.Error)
+	}
+	m := resp.Result.(map[string]any)
+	b, _ := json.Marshal(m)
+	var out map[string]interface{}
+	json.Unmarshal(b, &out)
+	hitsRaw, _ := out["hits"].([]interface{})
+	if len(hitsRaw) == 0 {
+		t.Errorf("expected at least 1 hit for multi-repo search")
 	}
 }
