@@ -147,8 +147,8 @@ func TestHandle_Impact_Found(t *testing.T) {
 	if _, ok := m["focusText"]; !ok {
 		t.Error("expected focusText in result")
 	}
-	if _, ok := m["focusJSON"]; !ok {
-		t.Error("expected focusJSON in result")
+	if _, ok := m["focus"]; !ok {
+		t.Error("expected focus in result")
 	}
 }
 
