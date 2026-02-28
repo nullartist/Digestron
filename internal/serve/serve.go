@@ -108,6 +108,9 @@ func handle(st *State, req proto.Request) proto.Response {
 				"cachedRepos": cachedRepos,
 			}}
 
+	case "ensureindexed":
+		return handleEnsureIndexed(st, req)
+
 	case "index":
 		return handleIndex(st, req)
 
