@@ -70,18 +70,15 @@ function getConfig<T>(key: string, def: T): T {
   return (cfg.get(key) as T) ?? def;
 }
 
-function ensureClient(output: vscode.OutputChannel): NDJSONClient {
+function ensureClient(output: vscode.OutputChannel, repoRoot: string): NDJSONClient {
   if (client && client.isRunning()) return client;
 
   const binPath = getConfig<string>("binaryPath", "digestron");
-  const repo = getRepoRootForRequest();
-  if (!repo) throw new Error("No workspace folder found");
-
   const timeoutMs = getConfig<number>("requestTimeoutMs", 600000);
 
   client = new NDJSONClient(
     binPath,
-    repo,
+    repoRoot,
     (s) => output.appendLine(s),
     timeoutMs
   );
@@ -144,6 +141,11 @@ export function activate(context: vscode.ExtensionContext) {
     if (!pick) return;
     pinnedRepoRoot = pick;
     vscode.window.showInformationMessage(`Digestron repo root set: ${pick}`);
+    // Restart the server so the next request uses the newly pinned root.
+    if (client) client.stop();
+    client = null;
+    output.show(true);
+    output.appendLine(`[digestron] repo root changed to ${pick}; server will restart on next request.`);
   }));
 
   // ── digestron.ensureIndexed ───────────────────────────────────────────────
@@ -157,7 +159,7 @@ export function activate(context: vscode.ExtensionContext) {
       const includeTests = getConfig<boolean>("includeTests", false);
       const includeJS = getConfig<boolean>("includeJS", false);
 
-      const c = ensureClient(output);
+      const c = ensureClient(output, repoRoot);
       const resp = await reqWithRestart(c, "ensureIndexed", {
         repoRoot,
         autoIndex,
@@ -200,7 +202,7 @@ export function activate(context: vscode.ExtensionContext) {
       const includeJS = getConfig<boolean>("includeJS", false);
       const autoIndex = getConfig<boolean>("autoIndex", true);
 
-      const c = ensureClient(output);
+      const c = ensureClient(output, repoRoot);
 
       const ensure = await reqWithRestart(c, "ensureIndexed", {
         repoRoot,
