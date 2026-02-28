@@ -18,7 +18,18 @@ type ExtractRequest struct {
 	TsconfigPaths []string        `json:"tsconfigPaths"`
 	IncludeTests  bool            `json:"includeTests"`
 	MaxFiles      int             `json:"maxFiles"`
+	SampleFiles   int             `json:"sampleFiles,omitempty"` // only process first N files (ts-morph side)
+	ForceEngine   string          `json:"forceEngine,omitempty"` // "ts-morph" | "tsc-api"
 	Emit          map[string]bool `json:"emit"`
+}
+
+// RunOptions groups the options for RunTSExtract.
+type RunOptions struct {
+	Tsconfigs    []string
+	IncludeTests bool
+	SampleFiles  int
+	ForceEngine  string
+	Emit         map[string]bool
 }
 
 // Diagnostic is a single diagnostic message from ts-extract.
@@ -38,12 +49,13 @@ type ExtractResponse struct {
 }
 
 // RunTSExtract executes the ts-extract Node.js tool as a child process.
-// If tsconfigs is empty, tsconfig paths are auto-detected from repoRoot.
-func RunTSExtract(repoRoot string, tsconfigs []string, includeTests bool) (*ExtractResponse, error) {
+// If opt.Tsconfigs is empty, tsconfig paths are auto-detected from repoRoot.
+func RunTSExtract(repoRoot string, opt RunOptions) (*ExtractResponse, error) {
+	tsconfigs := opt.Tsconfigs
 	if len(tsconfigs) == 0 {
 		auto, err := util.FindTSConfigs(repoRoot, util.FindTSConfigsOptions{
 			MaxResults:   50,
-			IncludeTests: includeTests,
+			IncludeTests: opt.IncludeTests,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("ts-extract: auto-detect tsconfigs: %w", err)
@@ -51,12 +63,9 @@ func RunTSExtract(repoRoot string, tsconfigs []string, includeTests bool) (*Extr
 		tsconfigs = auto
 	}
 
-	req := ExtractRequest{
-		RepoRoot:      repoRoot,
-		TsconfigPaths: tsconfigs,
-		IncludeTests:  includeTests,
-		MaxFiles:      200000,
-		Emit: map[string]bool{
+	emit := opt.Emit
+	if emit == nil {
+		emit = map[string]bool{
 			"modules":      true,
 			"symbols":      true,
 			"calls":        true,
@@ -64,7 +73,17 @@ func RunTSExtract(repoRoot string, tsconfigs []string, includeTests bool) (*Extr
 			"instantiates": true,
 			"entryPoints":  true,
 			"riskFlags":    true,
-		},
+		}
+	}
+
+	req := ExtractRequest{
+		RepoRoot:      repoRoot,
+		TsconfigPaths: tsconfigs,
+		IncludeTests:  opt.IncludeTests,
+		MaxFiles:      200000,
+		SampleFiles:   opt.SampleFiles,
+		ForceEngine:   opt.ForceEngine,
+		Emit:          emit,
 	}
 
 	payload, err := json.Marshal(req)
