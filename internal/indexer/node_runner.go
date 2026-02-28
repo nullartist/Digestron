@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"time"
+
+	"github.com/nullartist/digestron/internal/util"
 )
 
 // ExtractRequest is the JSON payload sent to ts-extract via stdin.
@@ -35,22 +37,33 @@ type ExtractResponse struct {
 	Raw         json.RawMessage `json:"raw"`
 }
 
-// RunTSExtract executes the ts-extract Node.js tool as a child process,
-// sending a request via stdin and returning the parsed response.
-func RunTSExtract(scriptPath string, repoRoot string, tsconfigs []string, includeTests bool) (*ExtractResponse, error) {
+// RunTSExtract executes the ts-extract Node.js tool as a child process.
+// If tsconfigs is empty, tsconfig paths are auto-detected from repoRoot.
+func RunTSExtract(repoRoot string, tsconfigs []string, includeTests bool) (*ExtractResponse, error) {
+	if len(tsconfigs) == 0 {
+		auto, err := util.FindTSConfigs(repoRoot, util.FindTSConfigsOptions{
+			MaxResults:   50,
+			IncludeTests: includeTests,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("ts-extract: auto-detect tsconfigs: %w", err)
+		}
+		tsconfigs = auto
+	}
+
 	req := ExtractRequest{
 		RepoRoot:      repoRoot,
 		TsconfigPaths: tsconfigs,
 		IncludeTests:  includeTests,
 		MaxFiles:      200000,
 		Emit: map[string]bool{
-			"modules":     true,
-			"symbols":     true,
-			"calls":       true,
-			"inherits":    true,
+			"modules":      true,
+			"symbols":      true,
+			"calls":        true,
+			"inherits":     true,
 			"instantiates": true,
-			"entryPoints": true,
-			"riskFlags":   true,
+			"entryPoints":  true,
+			"riskFlags":    true,
 		},
 	}
 
@@ -59,10 +72,16 @@ func RunTSExtract(scriptPath string, repoRoot string, tsconfigs []string, includ
 		return nil, fmt.Errorf("ts-extract: marshal request: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "node", scriptPath)
+	// Script path is resolved from the process CWD (where digestron is run from).
+	script, err := filepath.Abs(filepath.Join("tools", "ts-extract", "src", "index.mjs"))
+	if err != nil {
+		return nil, fmt.Errorf("ts-extract: resolve script path: %w", err)
+	}
+
+	cmd := exec.CommandContext(ctx, "node", script)
 	cmd.Stdin = bytes.NewReader(payload)
 
 	var stdout, stderr bytes.Buffer
@@ -82,7 +101,7 @@ func RunTSExtract(scriptPath string, repoRoot string, tsconfigs []string, includ
 		return nil, fmt.Errorf("invalid ts-extract json: %w\nraw: %s", err, stdout.String())
 	}
 	if !resp.Ok {
-		return &resp, errors.New("ts-extract returned ok=false")
+		return &resp, fmt.Errorf("ts-extract returned ok=false")
 	}
 	return &resp, nil
 }

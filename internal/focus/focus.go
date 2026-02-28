@@ -1,190 +1,238 @@
-// Package focus implements the USG v0.1 Focus Pack algorithm.
+// Package focus implements the USG v0.15 Focus Pack algorithm.
 //
-// It builds a compact "impact slice" around a seed symbol by BFS-traversing the
-// call graph up to a given radius, then formats the result as both plain text and
-// a JSON subgraph — all within a character budget.
+// BuildFocusPack builds a compact "impact slice" around a seed symbol using
+// O(1) index lookups via usg.View, groups callers/callees by file, and
+// formats the result within a character budget.
 package focus
 
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/nullartist/digestron/internal/usg"
 )
 
-const (
-	// riskFlagLineRadius is the number of lines around the seed's location
-	// within which risk flags are considered "nearby".
-	riskFlagLineRadius = 30
-
-	// maxListItems is the default display cap for callers, callees, and
-	// instantiation sites in the text output.
-	maxListItems = 10
-)
-
 // Options controls Focus Pack generation.
 type Options struct {
-	Radius      int // BFS hops from seed (default 2)
-	BudgetChars int // max characters for text output (default 8000)
-	MaxFiles    int // max distinct files in text output (default 12)
+	Radius             int // BFS hops from seed (default 2; reserved for future use)
+	BudgetChars        int // max characters for text output (default 8000)
+	MaxFiles           int // max distinct files in grouped output (default 12)
+	MaxLinesPerFile    int // max lines shown per file in grouped output (default 6)
+	MaxItemsPerSection int // max edges/items collected per section (default 40)
 }
 
 func (o *Options) defaults() {
-	if o.Radius == 0 {
+	if o.Radius <= 0 {
 		o.Radius = 2
 	}
-	if o.BudgetChars == 0 {
+	if o.BudgetChars <= 0 {
 		o.BudgetChars = 8000
 	}
-	if o.MaxFiles == 0 {
+	if o.MaxFiles <= 0 {
 		o.MaxFiles = 12
+	}
+	if o.MaxLinesPerFile <= 0 {
+		o.MaxLinesPerFile = 6
+	}
+	if o.MaxItemsPerSection <= 0 {
+		o.MaxItemsPerSection = 40
 	}
 }
 
 // Pack is the computed focus pack.
 type Pack struct {
-	SeedID       string
-	SeedSymbol   *usg.Symbol
-	Callers      []usg.Symbol
-	Callees      []usg.Symbol
-	Inherits     []usg.Symbol // parent symbols
+	SeedID     string
+	SeedSymbol usg.Symbol
+	Text       string
+
+	// subgraph retained for JSON output
+	Symbols      []usg.Symbol
+	Calls        []usg.CallEdge
 	Instantiates []usg.InstantiationSite
 	RiskFlags    []usg.RiskFlag
 	EntryPoints  []usg.EntryPoint
-
-	// subgraph for JSON output
-	Symbols []usg.Symbol
-	Calls   []usg.CallEdge
 }
 
 // Build computes a Focus Pack for seedID from the given graph.
+// seedID may be a symbol ID or qualified name.
 func Build(graph *usg.USG, seedID string, opts Options) (*Pack, error) {
 	opts.defaults()
 
-	symByID := make(map[string]*usg.Symbol, len(graph.Symbols))
-	for i := range graph.Symbols {
-		symByID[graph.Symbols[i].ID] = &graph.Symbols[i]
-	}
+	v := usg.BuildView(graph)
 
-	seed := symByID[seedID]
-	if seed == nil {
+	seed, ok := resolveSymbol(v, seedID)
+	if !ok {
 		return nil, fmt.Errorf("focus: seed symbol %q not found", seedID)
 	}
 
-	pack := &Pack{SeedID: seedID, SeedSymbol: seed}
+	callerEdges := callersOf(v, seed.ID, opts.MaxItemsPerSection)
+	calleeEdges := calleesOf(v, seed.ID, opts.MaxItemsPerSection)
+	inheritEdges := inheritanceOf(v, seed.ID, opts.MaxItemsPerSection)
+	insts := instantiationsOf(v, seed.ID, opts.MaxItemsPerSection)
+	risks := riskFlagsNear(graph, seed.Loc.File, seed.Loc.StartLine, 30, opts.MaxItemsPerSection)
 
-	// --- Direct callers (symbols that call the seed) ---
-	callerSet := make(map[string]bool)
+	// Build subgraph symbol set
+	subSymIDs := map[string]bool{seed.ID: true}
+	for _, e := range callerEdges {
+		subSymIDs[e.FromSymbolID] = true
+	}
+	for _, e := range calleeEdges {
+		if e.ToSymbolID != nil {
+			subSymIDs[*e.ToSymbolID] = true
+		}
+	}
+	for _, e := range inheritEdges {
+		subSymIDs[e.ParentSymbolID] = true
+	}
+	var subSymbols []usg.Symbol
+	for id := range subSymIDs {
+		if s, ok := v.SymbolByID[id]; ok {
+			subSymbols = append(subSymbols, s)
+		}
+	}
+	var subCalls []usg.CallEdge
 	for _, call := range graph.Edges.Calls {
-		if call.ToSymbolID != nil && *call.ToSymbolID == seedID {
-			callerSet[call.FromSymbolID] = true
-		}
-	}
-	for id := range callerSet {
-		if s := symByID[id]; s != nil {
-			pack.Callers = append(pack.Callers, *s)
+		if subSymIDs[call.FromSymbolID] && (call.ToSymbolID == nil || subSymIDs[*call.ToSymbolID]) {
+			subCalls = append(subCalls, call)
 		}
 	}
 
-	// --- Direct callees (symbols that the seed calls) ---
-	calleeSet := make(map[string]bool)
-	for _, call := range graph.Edges.Calls {
-		if call.FromSymbolID == seedID && call.ToSymbolID != nil {
-			calleeSet[*call.ToSymbolID] = true
-		}
-	}
-	for id := range calleeSet {
-		if s := symByID[id]; s != nil {
-			pack.Callees = append(pack.Callees, *s)
-		}
-	}
-
-	// --- Inheritance: parent symbols of seed ---
-	for _, inh := range graph.Edges.Inherits {
-		if inh.ChildSymbolID == seedID {
-			if s := symByID[inh.ParentSymbolID]; s != nil {
-				pack.Inherits = append(pack.Inherits, *s)
-			}
-		}
-	}
-
-	// --- Instantiation sites of the seed ---
-	for _, inst := range graph.Edges.Instantiates {
-		if inst.SymbolID == seedID {
-			pack.Instantiates = append(pack.Instantiates, inst)
-		}
-	}
-
-	// --- Risk flags in same file or within riskFlagLineRadius lines of seed ---
-	if seed.Loc.File != "" {
-		for _, rf := range graph.RiskFlags {
-			if rf.Loc.File == seed.Loc.File {
-				lineClose := seed.Loc.StartLine == 0 ||
-					(rf.Loc.Line >= seed.Loc.StartLine-riskFlagLineRadius && rf.Loc.Line <= seed.Loc.EndLine+riskFlagLineRadius)
-				if lineClose {
-					pack.RiskFlags = append(pack.RiskFlags, rf)
-				}
-			}
-		}
-	}
-
-	// --- Connected entry points (BFS inverse, limited to radius) ---
-	reachable := bfsCallers(graph, seedID, opts.Radius)
-	epFiles := make(map[string]bool)
-	for _, ep := range graph.EntryPoints {
-		epFiles[ep.File] = true
-	}
+	// Connected entry points (BFS inverse, limited to radius)
+	reachable := bfsCallers(v, seed.ID, opts.Radius)
+	var entryPoints []usg.EntryPoint
+	epSeen := map[string]bool{}
 	for _, sym := range reachable {
 		for _, ep := range graph.EntryPoints {
-			if ep.File == sym.Loc.File || (ep.SymbolID != nil && *ep.SymbolID == sym.ID) {
-				pack.EntryPoints = append(pack.EntryPoints, ep)
+			if !epSeen[ep.File] && (ep.File == sym.Loc.File || (ep.SymbolID != nil && *ep.SymbolID == sym.ID)) {
+				epSeen[ep.File] = true
+				entryPoints = append(entryPoints, ep)
 				break
 			}
 		}
 	}
 
-	// --- Build subgraph (seed + callers + callees) ---
-	subSymIDs := make(map[string]bool)
-	subSymIDs[seedID] = true
-	for _, s := range pack.Callers {
-		subSymIDs[s.ID] = true
-	}
-	for _, s := range pack.Callees {
-		subSymIDs[s.ID] = true
-	}
-	for _, s := range pack.Inherits {
-		subSymIDs[s.ID] = true
-	}
-	for id := range subSymIDs {
-		if s := symByID[id]; s != nil {
-			pack.Symbols = append(pack.Symbols, *s)
+	// Build text output with budget
+	text := buildText(v, graph, seed, callerEdges, calleeEdges, inheritEdges, insts, risks, entryPoints, opts)
+
+	return &Pack{
+		SeedID:       seed.ID,
+		SeedSymbol:   seed,
+		Text:         text,
+		Symbols:      subSymbols,
+		Calls:        subCalls,
+		Instantiates: insts,
+		RiskFlags:    risks,
+		EntryPoints:  entryPoints,
+	}, nil
+}
+
+// buildText assembles the text representation of the focus pack within the budget.
+func buildText(v *usg.View, graph *usg.USG, seed usg.Symbol,
+	callerEdges, calleeEdges []usg.CallEdge,
+	inheritEdges []usg.InheritanceEdge,
+	insts []usg.InstantiationSite,
+	risks []usg.RiskFlag,
+	entryPoints []usg.EntryPoint,
+	opts Options,
+) string {
+	var b strings.Builder
+	budget := opts.BudgetChars
+
+	write := func(s string) bool {
+		if budget > 0 && b.Len()+len(s) > budget {
+			return false
 		}
-	}
-	for _, call := range graph.Edges.Calls {
-		if subSymIDs[call.FromSymbolID] && (call.ToSymbolID == nil || subSymIDs[*call.ToSymbolID]) {
-			pack.Calls = append(pack.Calls, call)
-		}
+		b.WriteString(s)
+		return true
 	}
 
-	return pack, nil
+	write(fmt.Sprintf("SYMBOL: %s [%s]\n", seed.QName, seed.Kind))
+	write(fmt.Sprintf("SIGNATURE: %s\n", orNA(seed.Signature)))
+	write(fmt.Sprintf("LOC: %s:%d-%d\n\n", seed.Loc.File, seed.Loc.StartLine, seed.Loc.EndLine))
+
+	if len(callerEdges) > 0 {
+		write("CALLED BY:\n")
+		writeGroupedEdges(&b, v, callerEdges, opts, false)
+		write("\n")
+	}
+
+	if len(calleeEdges) > 0 {
+		write("CALLS:\n")
+		writeGroupedEdges(&b, v, calleeEdges, opts, true)
+		write("\n")
+	}
+
+	if len(insts) > 0 {
+		write("INSTANTIATIONS:\n")
+		writeGroupedLocations(&b, insts, opts)
+		write("\n")
+	}
+
+	if len(inheritEdges) > 0 {
+		write("INHERITANCE:\n")
+		for i, e := range inheritEdges {
+			if i >= opts.MaxItemsPerSection {
+				break
+			}
+			parent := shortSymbolQName(v, e.ParentSymbolID)
+			if !write(fmt.Sprintf("  - %s (%s)\n", parent, e.Confidence)) {
+				break
+			}
+		}
+		write("\n")
+	}
+
+	if len(entryPoints) > 0 {
+		write("ENTRY POINTS:\n")
+		seen := map[string]bool{}
+		for _, ep := range entryPoints {
+			if seen[ep.File] {
+				continue
+			}
+			seen[ep.File] = true
+			if !write(fmt.Sprintf("  [%s] %s\n", ep.Kind, ep.File)) {
+				break
+			}
+		}
+		write("\n")
+	}
+
+	if len(risks) > 0 {
+		write("RISK:\n")
+		for i, r := range risks {
+			if i >= opts.MaxItemsPerSection {
+				break
+			}
+			if !write(fmt.Sprintf("  - %s:%d %s (%s)\n", r.Loc.File, r.Loc.Line, r.Kind, r.Note)) {
+				break
+			}
+		}
+		write("\n")
+	}
+
+	write(fmt.Sprintf("STRUCTURAL CONFIDENCE (repo): %.2f\n", graph.Stats.StructuralConfidence))
+
+	result := b.String()
+	contentLen := len(result)
+	if budget > 0 && contentLen > budget {
+		result = result[:budget] + "\n... (truncated to budget)\n"
+	}
+	result += fmt.Sprintf("\nbudget: %d/%d chars used\n", contentLen, budget)
+	return result
 }
 
 // bfsCallers returns symbols reachable by inverse-call BFS up to maxHops.
-func bfsCallers(graph *usg.USG, seedID string, maxHops int) []usg.Symbol {
-	symByID := make(map[string]*usg.Symbol, len(graph.Symbols))
-	for i := range graph.Symbols {
-		symByID[graph.Symbols[i].ID] = &graph.Symbols[i]
-	}
-
+func bfsCallers(v *usg.View, seedID string, maxHops int) []usg.Symbol {
 	visited := map[string]bool{seedID: true}
 	frontier := []string{seedID}
 
 	for hop := 0; hop < maxHops && len(frontier) > 0; hop++ {
 		var next []string
 		for _, id := range frontier {
-			for _, call := range graph.Edges.Calls {
-				if call.ToSymbolID != nil && *call.ToSymbolID == id && !visited[call.FromSymbolID] {
+			for _, call := range v.CallersByTo[id] {
+				if !visited[call.FromSymbolID] {
 					visited[call.FromSymbolID] = true
 					next = append(next, call.FromSymbolID)
 				}
@@ -198,115 +246,220 @@ func bfsCallers(graph *usg.USG, seedID string, maxHops int) []usg.Symbol {
 		if id == seedID {
 			continue
 		}
-		if s := symByID[id]; s != nil {
-			result = append(result, *s)
+		if s, ok := v.SymbolByID[id]; ok {
+			result = append(result, s)
 		}
 	}
 	return result
 }
 
-// FormatText renders the Focus Pack as a compact plain-text block
-// trimmed to the character budget.
-func FormatText(pack *Pack, graph *usg.USG, opts Options) string {
-	opts.defaults()
+// --- grouping helpers ---
 
-	var sb strings.Builder
-	seedName := pack.SeedSymbol.QName
-	fmt.Fprintf(&sb, "=== Focus Pack: %s (radius=%d) ===\n", seedName, opts.Radius)
-	fmt.Fprintf(&sb, "structuralConfidence: %.2f\n\n", graph.Stats.StructuralConfidence)
+type fileLines struct {
+	File  string
+	Lines []int
+	Items []string
+}
 
-	// SEED
-	fmt.Fprintf(&sb, "[SEED] %s  [%s]\n", pack.SeedSymbol.QName, pack.SeedSymbol.Kind)
-	if pack.SeedSymbol.Signature != "" {
-		fmt.Fprintf(&sb, "  signature: %s\n", pack.SeedSymbol.Signature)
-	}
-	fmt.Fprintf(&sb, "  loc: %s:%d\n\n", pack.SeedSymbol.Loc.File, pack.SeedSymbol.Loc.StartLine)
+func writeGroupedEdges(b *strings.Builder, v *usg.View, edges []usg.CallEdge, opt Options, includeTarget bool) {
+	m := map[string]*fileLines{}
+	order := []string{}
 
-	// CALLERS
-	fmt.Fprintf(&sb, "[CALLERS] %d found:\n", len(pack.Callers))
-	for i, s := range pack.Callers {
-		if i >= maxListItems {
-			fmt.Fprintf(&sb, "  ...+%d more\n", len(pack.Callers)-maxListItems)
-			break
+	for _, e := range edges {
+		f := e.Loc.File
+		if _, ok := m[f]; !ok {
+			m[f] = &fileLines{File: f}
+			order = append(order, f)
 		}
-		fmt.Fprintf(&sb, "  %s  [%s]  @%s:%d\n", s.QName, s.Kind, s.Loc.File, s.Loc.StartLine)
-	}
-	sb.WriteByte('\n')
+		m[f].Lines = append(m[f].Lines, e.Loc.Line)
 
-	// CALLEES
-	fmt.Fprintf(&sb, "[CALLEES] %d found:\n", len(pack.Callees))
-	for i, s := range pack.Callees {
-		if i >= maxListItems {
-			fmt.Fprintf(&sb, "  ...+%d more\n", len(pack.Callees)-maxListItems)
-			break
+		if includeTarget {
+			target := "<unknown>"
+			if e.ToSymbolID != nil {
+				target = shortSymbolQName(v, *e.ToSymbolID)
+			} else if e.ToExternal != nil {
+				target = fmt.Sprintf("%s.%s", e.ToExternal.Module, e.ToExternal.Name)
+			}
+			m[f].Items = append(m[f].Items, fmt.Sprintf("%d -> %s (%s)", e.Loc.Line, target, e.Confidence))
+		} else {
+			m[f].Items = append(m[f].Items, fmt.Sprintf("%d (%s)", e.Loc.Line, e.Confidence))
 		}
-		fmt.Fprintf(&sb, "  %s  [%s]  @%s:%d\n", s.QName, s.Kind, s.Loc.File, s.Loc.StartLine)
 	}
-	sb.WriteByte('\n')
 
-	// INHERITS
-	if len(pack.Inherits) > 0 {
-		fmt.Fprintf(&sb, "[INHERITS] %d parent(s):\n", len(pack.Inherits))
-		for _, s := range pack.Inherits {
-			fmt.Fprintf(&sb, "  %s  [%s]\n", s.QName, s.Kind)
+	sort.SliceStable(order, func(i, j int) bool {
+		ai := len(m[order[i]].Lines)
+		aj := len(m[order[j]].Lines)
+		if ai != aj {
+			return ai > aj
 		}
-		sb.WriteByte('\n')
-	}
+		return order[i] < order[j]
+	})
 
-	// INSTANTIATIONS
-	if len(pack.Instantiates) > 0 {
-		fmt.Fprintf(&sb, "[INSTANTIATIONS] %d site(s):\n", len(pack.Instantiates))
-		for i, inst := range pack.Instantiates {
-			if i >= maxListItems {
-				fmt.Fprintf(&sb, "  ...+%d more\n", len(pack.Instantiates)-maxListItems)
+	filesShown := 0
+	for _, f := range order {
+		if filesShown >= opt.MaxFiles {
+			fmt.Fprintf(b, "  - +%d more files\n", len(order)-filesShown)
+			return
+		}
+		filesShown++
+		fl := m[f]
+		fmt.Fprintf(b, "  - %s:\n", fl.File)
+
+		printed := 0
+		for _, item := range fl.Items {
+			if printed >= opt.MaxLinesPerFile {
 				break
 			}
-			fmt.Fprintf(&sb, "  new [%s]  @%s:%d  confidence=%s\n",
-				pack.SeedSymbol.Name, inst.Loc.File, inst.Loc.Line, inst.Confidence)
+			fmt.Fprintf(b, "      - %s\n", item)
+			printed++
 		}
-		sb.WriteByte('\n')
+		if remaining := len(fl.Items) - printed; remaining > 0 {
+			fmt.Fprintf(b, "      - +%d more\n", remaining)
+		}
+	}
+}
+
+func writeGroupedLocations(b *strings.Builder, insts []usg.InstantiationSite, opt Options) {
+	m := map[string]*fileLines{}
+	order := []string{}
+
+	for _, i := range insts {
+		f := i.Loc.File
+		if _, ok := m[f]; !ok {
+			m[f] = &fileLines{File: f}
+			order = append(order, f)
+		}
+		m[f].Lines = append(m[f].Lines, i.Loc.Line)
+		m[f].Items = append(m[f].Items, fmt.Sprintf("%d (%s)", i.Loc.Line, i.Confidence))
 	}
 
-	// ENTRY POINTS
-	if len(pack.EntryPoints) > 0 {
-		seen := make(map[string]bool)
-		fmt.Fprintf(&sb, "[ENTRY POINTS] reachable:\n")
-		for _, ep := range pack.EntryPoints {
-			if seen[ep.File] {
-				continue
+	sort.SliceStable(order, func(i, j int) bool {
+		ai := len(m[order[i]].Lines)
+		aj := len(m[order[j]].Lines)
+		if ai != aj {
+			return ai > aj
+		}
+		return order[i] < order[j]
+	})
+
+	filesShown := 0
+	for _, f := range order {
+		if filesShown >= opt.MaxFiles {
+			fmt.Fprintf(b, "  - +%d more files\n", len(order)-filesShown)
+			return
+		}
+		filesShown++
+		fl := m[f]
+		fmt.Fprintf(b, "  - %s:\n", fl.File)
+
+		printed := 0
+		for _, item := range fl.Items {
+			if printed >= opt.MaxLinesPerFile {
+				break
 			}
-			seen[ep.File] = true
-			fmt.Fprintf(&sb, "  [%s] %s\n", ep.Kind, ep.File)
+			fmt.Fprintf(b, "      - %s\n", item)
+			printed++
 		}
-		sb.WriteByte('\n')
+		if remaining := len(fl.Items) - printed; remaining > 0 {
+			fmt.Fprintf(b, "      - +%d more\n", remaining)
+		}
 	}
+}
 
-	// RISK FLAGS
-	fmt.Fprintf(&sb, "[RISK FLAGS] %d nearby\n", len(pack.RiskFlags))
-	for _, rf := range pack.RiskFlags {
-		fmt.Fprintf(&sb, "  [%s] @%s:%d — %s\n", rf.Kind, rf.Loc.File, rf.Loc.Line, rf.Note)
+// --- data access helpers (via View) ---
+
+func resolveSymbol(v *usg.View, ref string) (usg.Symbol, bool) {
+	if s, ok := v.SymbolByID[ref]; ok {
+		return s, true
 	}
-
-	result := sb.String()
-
-	// budget trim: record actual content length before truncation
-	contentLen := len(result)
-	if opts.BudgetChars > 0 && contentLen > opts.BudgetChars {
-		result = result[:opts.BudgetChars] + "\n... (truncated to budget)\n"
+	if s, ok := v.SymbolByQName[ref]; ok {
+		return s, true
 	}
+	return usg.Symbol{}, false
+}
 
-	result += fmt.Sprintf("\nbudget: %d/%d chars used\n", contentLen, opts.BudgetChars)
-	return result
+func callersOf(v *usg.View, symbolID string, limit int) []usg.CallEdge {
+	edges := v.CallersByTo[symbolID]
+	if len(edges) > limit {
+		return edges[:limit]
+	}
+	return edges
+}
+
+func calleesOf(v *usg.View, symbolID string, limit int) []usg.CallEdge {
+	edges := v.CalleesByFrom[symbolID]
+	if len(edges) > limit {
+		return edges[:limit]
+	}
+	return edges
+}
+
+func inheritanceOf(v *usg.View, childID string, limit int) []usg.InheritanceEdge {
+	var out []usg.InheritanceEdge
+	for _, e := range v.Graph.Edges.Inherits {
+		if e.ChildSymbolID == childID {
+			out = append(out, e)
+			if len(out) >= limit {
+				break
+			}
+		}
+	}
+	return out
+}
+
+func instantiationsOf(v *usg.View, symbolID string, limit int) []usg.InstantiationSite {
+	var out []usg.InstantiationSite
+	for _, i := range v.Graph.Edges.Instantiates {
+		if i.SymbolID == symbolID {
+			out = append(out, i)
+			if len(out) >= limit {
+				break
+			}
+		}
+	}
+	return out
+}
+
+func shortSymbolQName(v *usg.View, id string) string {
+	if s, ok := v.SymbolByID[id]; ok {
+		return s.QName
+	}
+	return id
+}
+
+func riskFlagsNear(g *usg.USG, file string, line, window, limit int) []usg.RiskFlag {
+	var out []usg.RiskFlag
+	min := line - window
+	max := line + window
+	for _, r := range g.RiskFlags {
+		if r.Loc.File != file {
+			continue
+		}
+		if r.Loc.Line >= min && r.Loc.Line <= max {
+			out = append(out, r)
+			if len(out) >= limit {
+				break
+			}
+		}
+	}
+	return out
+}
+
+func orNA(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "n/a"
+	}
+	return s
 }
 
 // SubGraph is the JSON representation of the focus pack subgraph.
 type SubGraph struct {
-	SeedID       string              `json:"seedId"`
-	Symbols      []usg.Symbol        `json:"symbols"`
-	Calls        []usg.CallEdge      `json:"calls"`
+	SeedID       string                  `json:"seedId"`
+	Symbols      []usg.Symbol            `json:"symbols"`
+	Calls        []usg.CallEdge          `json:"calls"`
 	Instantiates []usg.InstantiationSite `json:"instantiates"`
-	RiskFlags    []usg.RiskFlag      `json:"riskFlags"`
-	EntryPoints  []usg.EntryPoint    `json:"entryPoints"`
+	RiskFlags    []usg.RiskFlag          `json:"riskFlags"`
+	EntryPoints  []usg.EntryPoint        `json:"entryPoints"`
 }
 
 // FormatJSON renders the Focus Pack as a JSON subgraph.
@@ -321,3 +474,4 @@ func FormatJSON(pack *Pack) ([]byte, error) {
 	}
 	return json.MarshalIndent(sg, "", "  ")
 }
+
