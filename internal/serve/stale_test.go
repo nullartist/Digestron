@@ -295,3 +295,61 @@ func TestHandle_EnsureIndexed_Stale_ReindexDisabled(t *testing.T) {
 		t.Errorf("expected STALE_INDEX, got %+v", resp.Error)
 	}
 }
+
+func writeOldUSG(t *testing.T, dir string) {
+t.Helper()
+usgDir := filepath.Join(dir, ".digestron")
+if err := os.MkdirAll(usgDir, 0o755); err != nil {
+t.Fatal(err)
+}
+usgPath := filepath.Join(usgDir, "usg.v0.1.json")
+if err := os.WriteFile(usgPath, []byte("{}"), 0o644); err != nil {
+t.Fatal(err)
+}
+old := time.Now().Add(-2 * time.Hour)
+if err := os.Chtimes(usgPath, old, old); err != nil {
+t.Fatal(err)
+}
+}
+
+func TestCheckRepoFreshness_ConfigFiles(t *testing.T) {
+configFiles := []string{
+"package.json",
+"package-lock.json",
+"pnpm-lock.yaml",
+"yarn.lock",
+"bun.lockb",
+"tsconfig.json",
+"tsconfig.base.json",
+"tsconfig.build.json",
+"turbo.json",
+"nx.json",
+".nvmrc",
+"vite.config.ts",
+"vite.config.js",
+"webpack.config.js",
+"rollup.config.mjs",
+"esbuild.config.js",
+"next.config.js",
+"next.config.ts",
+}
+
+for _, name := range configFiles {
+t.Run(name, func(t *testing.T) {
+dir := t.TempDir()
+writeOldUSG(t, dir)
+
+if err := os.WriteFile(filepath.Join(dir, name), []byte("{}"), 0o644); err != nil {
+t.Fatal(err)
+}
+
+fresh, err := CheckRepoFreshness(dir, FreshnessOptions{})
+if err != nil {
+t.Fatalf("unexpected error: %v", err)
+}
+if !fresh.IsStale {
+t.Errorf("IsStale should be true when %s is newer than USG (repoLatestFile=%s)", name, fresh.RepoLatestFile)
+}
+})
+}
+}

@@ -49,9 +49,33 @@ func CheckRepoFreshness(repoRoot string, opt FreshnessOptions) (RepoFreshness, e
 
 	isRelevant := func(path string) bool {
 		l := strings.ToLower(path)
+		base := strings.ToLower(filepath.Base(path))
+
+		// ---- Config & lock files (always relevant, regardless of test filters) ----
+		switch base {
+		case "package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb",
+			"tsconfig.json", "turbo.json", "nx.json", ".nvmrc":
+			return true
+		}
+		// tsconfig.*.json
+		if strings.HasPrefix(base, "tsconfig.") && strings.HasSuffix(base, ".json") {
+			return true
+		}
+		// common build configs
+		for _, p := range []string{
+			"vite.config.", "webpack.config.", "rollup.config.", "esbuild.config.", "next.config.",
+		} {
+			if strings.HasPrefix(base, p) {
+				return true
+			}
+		}
+
+		// ---- Code files (subject to test filters) ----
 		if !opt.IncludeTests {
 			if strings.Contains(l, "__tests__") || strings.Contains(l, "/tests/") || strings.Contains(l, "\\tests\\") {
-				return false
+				if strings.HasSuffix(l, ".ts") || strings.HasSuffix(l, ".tsx") || strings.HasSuffix(l, ".js") || strings.HasSuffix(l, ".jsx") {
+					return false
+				}
 			}
 			if strings.Contains(l, ".spec.") || strings.Contains(l, ".test.") {
 				return false
