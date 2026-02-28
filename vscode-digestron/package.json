@@ -1,0 +1,79 @@
+{
+  "name": "digestron",
+  "displayName": "Digestron",
+  "description": "Structural context + focus packs for large codebases (stdio server).",
+  "version": "0.0.1",
+  "publisher": "digestron",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other"],
+  "activationEvents": [
+    "onCommand:digestron.ensureIndexed",
+    "onCommand:digestron.impactUnderCursor",
+    "onCommand:digestron.copyLastFocusPack",
+    "onCommand:digestron.restartServer",
+    "onCommand:digestron.openLastFocusPack",
+    "onCommand:digestron.openFocusPackScratch",
+    "onCommand:digestron.selectRepoRoot"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "digestron.ensureIndexed", "title": "Digestron: Ensure Indexed" },
+      { "command": "digestron.impactUnderCursor", "title": "Digestron: Impact Symbol Under Cursor (with snippets)" },
+      { "command": "digestron.copyLastFocusPack", "title": "Digestron: Copy Last Focus Pack" },
+      { "command": "digestron.openLastFocusPack", "title": "Digestron: Open Last Focus Pack" },
+      { "command": "digestron.openFocusPackScratch", "title": "Digestron: Open Focus Pack in Scratch File" },
+      { "command": "digestron.selectRepoRoot", "title": "Digestron: Select Repo Root" },
+      { "command": "digestron.restartServer", "title": "Digestron: Restart Server" }
+    ],
+    "configuration": {
+      "title": "Digestron",
+      "properties": {
+        "digestron.binaryPath": {
+          "type": "string",
+          "default": "digestron",
+          "description": "Path to digestron binary (or just 'digestron' if in PATH)."
+        },
+        "digestron.autoIndex": {
+          "type": "boolean",
+          "default": true,
+          "description": "If true, ensureIndexed will auto-run index when no USG exists or it is stale."
+        },
+        "digestron.includeTests": {
+          "type": "boolean",
+          "default": false,
+          "description": "Include tests for freshness check and indexing."
+        },
+        "digestron.includeJS": {
+          "type": "boolean",
+          "default": false,
+          "description": "Consider JS files for freshness check (optional)."
+        },
+        "digestron.snippetsBudgetChars": {
+          "type": "number",
+          "default": 8000,
+          "description": "Snippet budget for impact requests."
+        },
+        "digestron.focusBudgetChars": {
+          "type": "number",
+          "default": 9000,
+          "description": "Focus pack budget for impact requests."
+        },
+        "digestron.requestTimeoutMs": {
+          "type": "number",
+          "default": 600000,
+          "description": "Timeout for requests to digestron server."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "tsc -p ."
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  }
+}
