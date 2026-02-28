@@ -30,6 +30,32 @@ async function main() {
   }
 
   let diagnostics = [];
+
+  const engine = (req.forceEngine || "").toLowerCase();
+
+  if (engine === "tsc-api") {
+    try {
+      const raw = await extractWithTSC(req, diagnostics);
+      process.stdout.write(JSON.stringify({ ok: true, toolVersion: "ts-extract.v0.1", engine: "tsc-api", diagnostics, raw }));
+    } catch (e) {
+      diagnostics.push(diag("error", "EXTRACT_FAIL", String(e?.message || e)));
+      process.stdout.write(JSON.stringify({ ok: false, toolVersion: "ts-extract.v0.1", engine: "tsc-api", diagnostics }));
+    }
+    return;
+  }
+
+  if (engine === "ts-morph") {
+    try {
+      const raw = await extractWithTsMorph(req, diagnostics);
+      process.stdout.write(JSON.stringify({ ok: true, toolVersion: "ts-extract.v0.1", engine: "ts-morph", diagnostics, raw }));
+    } catch (e) {
+      diagnostics.push(diag("error", "EXTRACT_FAIL", String(e?.message || e)));
+      process.stdout.write(JSON.stringify({ ok: false, toolVersion: "ts-extract.v0.1", engine: "ts-morph", diagnostics }));
+    }
+    return;
+  }
+
+  // default behavior: try ts-morph then fallback to tsc-api
   try {
     const raw = await extractWithTsMorph(req, diagnostics);
     process.stdout.write(JSON.stringify({

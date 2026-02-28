@@ -375,6 +375,31 @@ func resolveSymbol(v *usg.View, ref string) (usg.Symbol, bool) {
 	if s, ok := v.SymbolByQName[ref]; ok {
 		return s, true
 	}
+
+	// fallback fuzzy: contains on qname/name (simple, deterministic)
+	q := strings.ToLower(ref)
+	bestScore := 0
+	var best usg.Symbol
+	for _, s := range v.SymbolByID {
+		name := strings.ToLower(s.Name)
+		qn := strings.ToLower(s.QName)
+		score := 0
+		if name == q {
+			score += 100
+		} else if strings.Contains(name, q) {
+			score += 60
+		}
+		if strings.Contains(qn, q) {
+			score += 40
+		}
+		if score > bestScore {
+			bestScore = score
+			best = s
+		}
+	}
+	if bestScore >= 60 {
+		return best, true
+	}
 	return usg.Symbol{}, false
 }
 
@@ -474,4 +499,3 @@ func FormatJSON(pack *Pack) ([]byte, error) {
 	}
 	return json.MarshalIndent(sg, "", "  ")
 }
-

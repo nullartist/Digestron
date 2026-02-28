@@ -32,9 +32,26 @@ export async function extractWithTsMorph(req, diagnostics) {
   const tsconfigAbs = path.join(repoRoot, tsconfigPaths[0]);
   const project = new Project({ tsConfigFilePath: tsconfigAbs });
 
-  const sourceFiles = project.getSourceFiles();
-  if (sourceFiles.length > (req.maxFiles || 200000)) {
-    throw new Error(`Too many files: ${sourceFiles.length} > maxFiles`);
+  const sourceFilesAll = project.getSourceFiles()
+    .filter(sf => !sf.isFromExternalLibrary() && !sf.getFilePath().endsWith(".d.ts"));
+
+  if (sourceFilesAll.length > (req.maxFiles || 200000)) {
+    throw new Error(`Too many files: ${sourceFilesAll.length} > maxFiles`);
+  }
+
+  let sourceFiles = sourceFilesAll;
+  if (req.sampleFiles && req.sampleFiles > 0) {
+    const score = (p) => {
+      const f = p.toLowerCase();
+      let s = 0;
+      if (f.endsWith("/index.ts") || f.endsWith("/main.ts") || f.endsWith("/server.ts")) s += 50;
+      s -= f.split("/").length;
+      return s;
+    };
+    sourceFiles = [...sourceFiles].sort(
+      (a, b) => score(rel(repoRoot, b.getFilePath())) - score(rel(repoRoot, a.getFilePath()))
+    ).slice(0, req.sampleFiles);
+    diagnostics.push({ level: "info", code: "SAMPLE_MODE", message: `Processing sampleFiles=${req.sampleFiles}` });
   }
 
   // Modules
