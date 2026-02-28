@@ -1,8 +1,13 @@
 import * as vscode from "vscode";
 import { NDJSONClient } from "./ndjsonClient";
+import { FocusDocProvider, FOCUS_PACK_URI } from "./focusDoc";
 
 let client: NDJSONClient | null = null;
 let lastFocusPackText: string | null = null;
+let pinnedRepoRoot: string | null = null;
+
+// Characters to scan on each side of the cursor when searching for dotted identifiers.
+const SYMBOL_SEARCH_WINDOW = 80;
 
 function getWorkspaceRoots(): string[] {
   const folders = vscode.workspace.workspaceFolders || [];
@@ -25,13 +30,37 @@ function getActiveRepoRoot(): string | null {
   return roots.length ? roots[0] : null;
 }
 
+// Returns pinned root if set, otherwise falls back to active file's workspace folder.
+function getRepoRootForRequest(): string | null {
+  return pinnedRepoRoot || getActiveRepoRoot();
+}
+
 function symbolUnderCursor(): string {
   const editor = vscode.window.activeTextEditor;
   if (!editor) return "";
+
   const sel = editor.selection;
   if (!sel.isEmpty) return editor.document.getText(sel).trim();
 
-  const wordRange = editor.document.getWordRangeAtPosition(sel.active, /[A-Za-z0-9_.$]+/);
+  const pos = sel.active;
+  const lineText = editor.document.lineAt(pos.line).text;
+
+  // Look around cursor ±80 chars for a dotted identifier (e.g. foo.bar.baz)
+  const start = Math.max(0, pos.character - SYMBOL_SEARCH_WINDOW);
+  const end = Math.min(lineText.length, pos.character + SYMBOL_SEARCH_WINDOW);
+  const windowText = lineText.slice(start, end);
+
+  const dotted = /[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)+/g;
+  for (const m of windowText.matchAll(dotted)) {
+    const tokenStart = start + (m.index ?? 0);
+    const tokenEnd = tokenStart + m[0].length;
+    if (pos.character >= tokenStart && pos.character <= tokenEnd) {
+      return m[0];
+    }
+  }
+
+  // Fallback to simple word at cursor
+  const wordRange = editor.document.getWordRangeAtPosition(pos, /[A-Za-z0-9_.$]+/);
   if (!wordRange) return "";
   return editor.document.getText(wordRange).trim();
 }
@@ -45,7 +74,7 @@ function ensureClient(output: vscode.OutputChannel): NDJSONClient {
   if (client && client.isRunning()) return client;
 
   const binPath = getConfig<string>("binaryPath", "digestron");
-  const repo = getActiveRepoRoot();
+  const repo = getRepoRootForRequest();
   if (!repo) throw new Error("No workspace folder found");
 
   const timeoutMs = getConfig<number>("requestTimeoutMs", 600000);
@@ -60,12 +89,42 @@ function ensureClient(output: vscode.OutputChannel): NDJSONClient {
   return client;
 }
 
+// Wraps a single request with one auto-restart retry if the server has died.
+async function reqWithRestart(
+  c: NDJSONClient,
+  op: string,
+  params: Record<string, unknown>,
+  output: vscode.OutputChannel
+): Promise<import("./ndjsonClient").DigestronResponse> {
+  try {
+    return await c.request(op, params);
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    output.appendLine(`[digestron] ${op} request failed, restarting once: ${msg}`);
+    c.stop();
+    c.start();
+    return await c.request(op, params);
+  }
+}
+
 export function activate(context: vscode.ExtensionContext) {
   const output = vscode.window.createOutputChannel("Digestron");
   output.appendLine("[digestron] extension activated");
 
+  // ── Virtual document provider for focus pack viewer ──────────────────────
+  const focusProvider = new FocusDocProvider();
+  context.subscriptions.push(
+    vscode.workspace.registerTextDocumentContentProvider("digestron", focusProvider)
+  );
+
+  async function openFocusDoc() {
+    const doc = await vscode.workspace.openTextDocument(FOCUS_PACK_URI);
+    await vscode.window.showTextDocument(doc, { preview: false });
+  }
+
   context.subscriptions.push(output);
 
+  // ── digestron.restartServer ───────────────────────────────────────────────
   context.subscriptions.push(vscode.commands.registerCommand("digestron.restartServer", async () => {
     output.show(true);
     if (client) client.stop();
@@ -74,10 +133,24 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.window.showInformationMessage("Digestron server restarted.");
   }));
 
+  // ── digestron.selectRepoRoot ──────────────────────────────────────────────
+  context.subscriptions.push(vscode.commands.registerCommand("digestron.selectRepoRoot", async () => {
+    const roots = getWorkspaceRoots();
+    if (!roots.length) {
+      vscode.window.showWarningMessage("No workspace folders.");
+      return;
+    }
+    const pick = await vscode.window.showQuickPick(roots, { placeHolder: "Select Digestron repo root" });
+    if (!pick) return;
+    pinnedRepoRoot = pick;
+    vscode.window.showInformationMessage(`Digestron repo root set: ${pick}`);
+  }));
+
+  // ── digestron.ensureIndexed ───────────────────────────────────────────────
   context.subscriptions.push(vscode.commands.registerCommand("digestron.ensureIndexed", async () => {
     output.show(true);
     try {
-      const repoRoot = getActiveRepoRoot();
+      const repoRoot = getRepoRootForRequest();
       if (!repoRoot) throw new Error("No workspace folder found");
 
       const autoIndex = getConfig<boolean>("autoIndex", true);
@@ -85,13 +158,13 @@ export function activate(context: vscode.ExtensionContext) {
       const includeJS = getConfig<boolean>("includeJS", false);
 
       const c = ensureClient(output);
-      const resp = await c.request("ensureIndexed", {
+      const resp = await reqWithRestart(c, "ensureIndexed", {
         repoRoot,
         autoIndex,
         reindexIfStale: autoIndex,
         includeTests,
         includeJS
-      });
+      }, output);
 
       if (!resp.ok) {
         vscode.window.showErrorMessage(`Digestron ensureIndexed failed: ${resp.error?.code} ${resp.error?.message}`);
@@ -108,10 +181,11 @@ export function activate(context: vscode.ExtensionContext) {
     }
   }));
 
+  // ── digestron.impactUnderCursor ───────────────────────────────────────────
   context.subscriptions.push(vscode.commands.registerCommand("digestron.impactUnderCursor", async () => {
     output.show(true);
     try {
-      const repoRoot = getActiveRepoRoot();
+      const repoRoot = getRepoRootForRequest();
       if (!repoRoot) throw new Error("No workspace folder found");
 
       const ref = symbolUnderCursor();
@@ -128,26 +202,26 @@ export function activate(context: vscode.ExtensionContext) {
 
       const c = ensureClient(output);
 
-      const ensure = await c.request("ensureIndexed", {
+      const ensure = await reqWithRestart(c, "ensureIndexed", {
         repoRoot,
         autoIndex,
         reindexIfStale: autoIndex,
         includeTests,
         includeJS
-      });
+      }, output);
       if (!ensure.ok) {
         vscode.window.showErrorMessage(`Digestron ensureIndexed failed: ${ensure.error?.code} ${ensure.error?.message}`);
         return;
       }
 
-      const resp = await c.request("impact", {
+      const resp = await reqWithRestart(c, "impact", {
         repoRoot,
         ref,
         radius: 2,
         budgetChars: focusBudget,
         includeSnippets: true,
         snippetsBudgetChars: snippetsBudget
-      });
+      }, output);
 
       if (!resp.ok) {
         vscode.window.showErrorMessage(`Digestron impact failed: ${resp.error?.code} ${resp.error?.message}`);
@@ -165,13 +239,16 @@ export function activate(context: vscode.ExtensionContext) {
       lastFocusPackText = composed;
 
       await vscode.env.clipboard.writeText(composed);
-      vscode.window.showInformationMessage(`Digestron: copied focus pack for "${ref}" to clipboard.`);
+      focusProvider.setContent(composed);
+      await openFocusDoc();
+      vscode.window.showInformationMessage(`Digestron: focus pack for "${ref}" copied to clipboard and opened.`);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       vscode.window.showErrorMessage(`Digestron: ${msg}`);
     }
   }));
 
+  // ── digestron.copyLastFocusPack ───────────────────────────────────────────
   context.subscriptions.push(vscode.commands.registerCommand("digestron.copyLastFocusPack", async () => {
     output.show(true);
     if (!lastFocusPackText) {
@@ -181,9 +258,32 @@ export function activate(context: vscode.ExtensionContext) {
     await vscode.env.clipboard.writeText(lastFocusPackText);
     vscode.window.showInformationMessage("Digestron: last focus pack copied to clipboard.");
   }));
+
+  // ── digestron.openLastFocusPack ───────────────────────────────────────────
+  context.subscriptions.push(vscode.commands.registerCommand("digestron.openLastFocusPack", async () => {
+    output.show(true);
+    if (!lastFocusPackText) {
+      vscode.window.showWarningMessage("No focus pack available yet. Run Impact first.");
+      return;
+    }
+    focusProvider.setContent(lastFocusPackText);
+    await openFocusDoc();
+  }));
+
+  // ── digestron.openFocusPackScratch ────────────────────────────────────────
+  context.subscriptions.push(vscode.commands.registerCommand("digestron.openFocusPackScratch", async () => {
+    output.show(true);
+    if (!lastFocusPackText) {
+      vscode.window.showWarningMessage("No focus pack available yet. Run Impact first.");
+      return;
+    }
+    const doc = await vscode.workspace.openTextDocument({ content: lastFocusPackText, language: "markdown" });
+    await vscode.window.showTextDocument(doc, { preview: false });
+  }));
 }
 
 export function deactivate() {
   if (client) client.stop();
   client = null;
 }
+

@@ -10,7 +10,10 @@
     "onCommand:digestron.ensureIndexed",
     "onCommand:digestron.impactUnderCursor",
     "onCommand:digestron.copyLastFocusPack",
-    "onCommand:digestron.restartServer"
+    "onCommand:digestron.restartServer",
+    "onCommand:digestron.openLastFocusPack",
+    "onCommand:digestron.openFocusPackScratch",
+    "onCommand:digestron.selectRepoRoot"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -18,6 +21,9 @@
       { "command": "digestron.ensureIndexed", "title": "Digestron: Ensure Indexed" },
       { "command": "digestron.impactUnderCursor", "title": "Digestron: Impact Symbol Under Cursor (with snippets)" },
       { "command": "digestron.copyLastFocusPack", "title": "Digestron: Copy Last Focus Pack" },
+      { "command": "digestron.openLastFocusPack", "title": "Digestron: Open Last Focus Pack" },
+      { "command": "digestron.openFocusPackScratch", "title": "Digestron: Open Focus Pack in Scratch File" },
+      { "command": "digestron.selectRepoRoot", "title": "Digestron: Select Repo Root" },
       { "command": "digestron.restartServer", "title": "Digestron: Restart Server" }
     ],
     "configuration": {
