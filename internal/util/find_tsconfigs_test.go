@@ -69,7 +69,7 @@ func TestFindTSConfigs_SkipsNodeModules(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	for _, p := range got {
-		if filepath.Base(filepath.Dir(p)) == "node_modules" || contains(p, "node_modules") {
+		if contains(p, "node_modules") {
 			t.Errorf("should not include node_modules path: %s", p)
 		}
 	}
