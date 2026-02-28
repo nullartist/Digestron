@@ -310,15 +310,33 @@ func handleSearch(st *State, req proto.Request) proto.Response {
 		Result: map[string]any{"hits": hits}}
 }
 
-// handleImpact builds a FocusPack for the requested symbol.
+// handleImpact builds a FocusPackJSON for the requested symbol.
 func handleImpact(st *State, req proto.Request) proto.Response {
 	st.mu.RLock()
 	g := st.graph
+	v := st.view
+	repoRoot := st.repoRoot
 	st.mu.RUnlock()
 
-	if g == nil {
-		return proto.Response{V: req.V, ID: req.ID, Ok: false,
-			Error: &proto.ErrorObj{Code: "NOT_INDEXED", Message: "run index first"}}
+	// Try to load from disk when not yet indexed (nice UX).
+	if g == nil || v == nil {
+		if rr, ok := req.Params["repoRoot"].(string); ok && rr != "" {
+			if abs, err := filepath.Abs(rr); err == nil {
+				repoRoot = abs
+			}
+		}
+		loaded, err := usg.Load(repoRoot)
+		if err != nil {
+			return proto.Response{V: req.V, ID: req.ID, Ok: false,
+				Error: &proto.ErrorObj{Code: "NOT_INDEXED", Message: "run index first"}}
+		}
+		g = loaded
+		v = usg.BuildView(loaded)
+		st.mu.Lock()
+		st.repoRoot = repoRoot
+		st.graph = g
+		st.view = v
+		st.mu.Unlock()
 	}
 
 	ref, _ := req.Params["ref"].(string)
@@ -328,14 +346,18 @@ func handleImpact(st *State, req proto.Request) proto.Response {
 	}
 
 	radius := 2
-	if r, ok := req.Params["radius"].(float64); ok {
+	if r, ok := req.Params["radius"].(float64); ok && int(r) > 0 {
 		radius = int(r)
 	}
-	budgetChars := 8000
-	if b, ok := req.Params["budgetChars"].(float64); ok {
+	budgetChars := 9000
+	if b, ok := req.Params["budgetChars"].(float64); ok && int(b) > 0 {
 		budgetChars = int(b)
 	}
 	includeSnippets, _ := req.Params["includeSnippets"].(bool)
+	snipBudget := 8000
+	if x, ok := req.Params["snippetsBudgetChars"].(float64); ok && int(x) > 0 {
+		snipBudget = int(x)
+	}
 
 	opts := focus.Options{Radius: radius, BudgetChars: budgetChars}
 	pack, err := focus.Build(g, ref, opts)
@@ -344,112 +366,56 @@ func handleImpact(st *State, req proto.Request) proto.Response {
 			Error: &proto.ErrorObj{Code: "SYMBOL_NOT_FOUND", Message: err.Error()}}
 	}
 
-	focusJSON, err := focus.FormatJSON(pack)
-	if err != nil {
-		return proto.Response{V: req.V, ID: req.ID, Ok: false,
-			Error: &proto.ErrorObj{Code: "JSON_ERROR", Message: err.Error()}}
-	}
-
-	result := map[string]any{
-		"focusText": pack.Text,
-		"focusJSON": json.RawMessage(focusJSON),
-	}
+	fp := focus.BuildPackJSON(pack, g, v, repoRoot, radius, budgetChars)
 
 	if includeSnippets {
-		st.mu.RLock()
-		repoRoot := st.repoRoot
-		st.mu.RUnlock()
-
-		var sreqs []snippets.SnippetRequest
-
-		// Seed symbol range.
-		seed := pack.SeedSymbol
-		if seed.Loc.File != "" {
-			sreqs = append(sreqs, snippets.SnippetRequest{
-				File:      seed.Loc.File,
-				StartLine: seed.Loc.StartLine,
-				EndLine:   seed.Loc.EndLine,
-				Label:     "seed",
-				Priority:  10,
-			})
-		}
-
-		// Top 3 callers (by first occurrence).
-		callerCount := 0
-		seenCallerFile := map[string]bool{}
-		for _, e := range pack.Calls {
-			if e.ToSymbolID != nil && *e.ToSymbolID == pack.SeedID {
-				if callerCount >= 3 {
-					break
-				}
-				if seenCallerFile[e.Loc.File] {
-					continue
-				}
-				seenCallerFile[e.Loc.File] = true
-				sreqs = append(sreqs, snippets.SnippetRequest{
-					File:     e.Loc.File,
-					Line:     e.Loc.Line,
-					Label:    "caller",
-					Priority: 5,
-				})
-				callerCount++
-			}
-		}
-
-		// Top 3 callees.
-		calleeCount := 0
-		seenCalleeFile := map[string]bool{}
-		for _, e := range pack.Calls {
-			if e.FromSymbolID == pack.SeedID {
-				if calleeCount >= 3 {
-					break
-				}
-				if seenCalleeFile[e.Loc.File] {
-					continue
-				}
-				seenCalleeFile[e.Loc.File] = true
-				sreqs = append(sreqs, snippets.SnippetRequest{
-					File:     e.Loc.File,
-					Line:     e.Loc.Line,
-					Label:    "callee",
-					Priority: 3,
-				})
-				calleeCount++
-			}
-		}
-
-		snipBudget := budgetChars
-		if snipBudget > 9000 {
-			snipBudget = 9000
-		}
-		blocks, snipText, _ := snippets.Build(sreqs, snippets.Options{
+		sreqs := focus.BuildSnippetRequests(fp, 3, 3)
+		blocks, text, _ := snippets.Build(sreqs, snippets.Options{
 			RepoRoot:    repoRoot,
 			BudgetChars: snipBudget,
+			MergeGap:    2,
 		})
-		result["snippetsText"] = snipText
-		result["snippetsBlocks"] = blocks
+		snipBlocks := make([]focus.SnippetBlockJSON, 0, len(blocks))
+		for _, b := range blocks {
+			snipBlocks = append(snipBlocks, focus.SnippetBlockJSON{
+				File: b.File, StartLine: b.StartLine, EndLine: b.EndLine,
+				Label: b.Label, Text: b.Text,
+			})
+		}
+		fp.Snippets = &focus.SnippetsPayload{
+			BudgetChars: snipBudget,
+			Blocks:      snipBlocks,
+			Text:        text,
+		}
 	}
 
-	return proto.Response{V: req.V, ID: req.ID, Ok: true, Result: result}
+	return proto.Response{V: req.V, ID: req.ID, Ok: true, Result: map[string]any{
+		"focusText": pack.Text,
+		"focus":     fp,
+	}}
 }
 
 // handleSnippets extracts code snippets for an explicit list of locations.
+// Accepts either a "requests" or legacy "locs" array in params.
 func handleSnippets(st *State, req proto.Request) proto.Response {
 	st.mu.RLock()
 	repoRoot := st.repoRoot
 	st.mu.RUnlock()
 
 	budgetChars := 8000
-	if b, ok := req.Params["budgetChars"].(float64); ok {
+	if b, ok := req.Params["budgetChars"].(float64); ok && int(b) > 0 {
 		budgetChars = int(b)
 	}
 
-	// Decode locs from params["locs"] — a JSON array of SnippetRequest objects.
+	// Accept "requests" (v0.25) or legacy "locs".
 	var sreqs []snippets.SnippetRequest
-	if raw, ok := req.Params["locs"]; ok {
-		b, err := json.Marshal(raw)
-		if err == nil {
-			_ = json.Unmarshal(b, &sreqs)
+	for _, key := range []string{"requests", "locs"} {
+		if raw, ok := req.Params[key]; ok {
+			b, err := json.Marshal(raw)
+			if err == nil {
+				_ = json.Unmarshal(b, &sreqs)
+			}
+			break
 		}
 	}
 
@@ -468,7 +434,8 @@ func handleSnippets(st *State, req proto.Request) proto.Response {
 	}
 
 	return proto.Response{V: req.V, ID: req.ID, Ok: true, Result: map[string]any{
-		"blocks": blocks,
-		"text":   text,
+		"budgetChars": budgetChars,
+		"blocks":      blocks,
+		"text":        text,
 	}}
 }

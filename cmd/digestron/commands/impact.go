@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,13 +11,16 @@ import (
 
 	"github.com/nullartist/digestron/internal/focus"
 	"github.com/nullartist/digestron/internal/search"
+	"github.com/nullartist/digestron/internal/snippets"
 	"github.com/nullartist/digestron/internal/usg"
 )
 
 var impactFlags struct {
-	Radius      int
-	BudgetChars int
-	JSON        bool
+	Radius         int
+	BudgetChars    int
+	JSON           bool
+	Snippets       bool
+	SnippetsBudget int
 }
 
 var impactCmd = &cobra.Command{
@@ -31,8 +35,10 @@ var impactCmd = &cobra.Command{
 
 func init() {
 	impactCmd.Flags().IntVar(&impactFlags.Radius, "radius", 2, "BFS radius for caller traversal")
-	impactCmd.Flags().IntVar(&impactFlags.BudgetChars, "budget-chars", 8000, "Max characters for text output")
-	impactCmd.Flags().BoolVar(&impactFlags.JSON, "json", false, "Output the focus subgraph as JSON")
+	impactCmd.Flags().IntVar(&impactFlags.BudgetChars, "budget-chars", 9000, "Max characters for text output")
+	impactCmd.Flags().BoolVar(&impactFlags.JSON, "json", false, "Output the focus pack as JSON (FocusPackJSON v0.25)")
+	impactCmd.Flags().BoolVar(&impactFlags.Snippets, "snippets", false, "Include code snippets in JSON output (requires --json)")
+	impactCmd.Flags().IntVar(&impactFlags.SnippetsBudget, "snippets-budget", 8000, "Snippet budget in chars (requires --snippets)")
 }
 
 func runImpact(_ *cobra.Command, args []string) error {
@@ -85,7 +91,31 @@ func runImpact(_ *cobra.Command, args []string) error {
 	}
 
 	if impactFlags.JSON {
-		data, err := focus.FormatJSON(pack)
+		v := usg.BuildView(graph)
+		fp := focus.BuildPackJSON(pack, graph, v, absRoot, impactFlags.Radius, impactFlags.BudgetChars)
+
+		if impactFlags.Snippets {
+			sreqs := focus.BuildSnippetRequests(fp, 3, 3)
+			blocks, text, _ := snippets.Build(sreqs, snippets.Options{
+				RepoRoot:    absRoot,
+				BudgetChars: impactFlags.SnippetsBudget,
+				MergeGap:    2,
+			})
+			snipBlocks := make([]focus.SnippetBlockJSON, 0, len(blocks))
+			for _, b := range blocks {
+				snipBlocks = append(snipBlocks, focus.SnippetBlockJSON{
+					File: b.File, StartLine: b.StartLine, EndLine: b.EndLine,
+					Label: b.Label, Text: b.Text,
+				})
+			}
+			fp.Snippets = &focus.SnippetsPayload{
+				BudgetChars: impactFlags.SnippetsBudget,
+				Blocks:      snipBlocks,
+				Text:        text,
+			}
+		}
+
+		data, err := json.MarshalIndent(fp, "", "  ")
 		if err != nil {
 			return fmt.Errorf("impact: json: %w", err)
 		}
